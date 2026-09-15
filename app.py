@@ -41,17 +41,19 @@ with col_links:
         help="Vorsichtig = Wenig Einsatz pro Trade. Aggressiv = Hoher Einsatz, mehr Gewinnchance, aber auch höheres Verlustrisiko."
     )
     
-    # NEU: Der Schieberegler gegen die "Schüchternheit" der KI
+    # KORRIGIERT: Der Schieberegler erlaubt jetzt realistische mathematische Werte
     ki_sicherheit = st.slider(
         "Ab welcher Sicherheit soll die KI kaufen?", 
-        min_value=50.0, max_value=60.0, value=51.0, step=0.5,
-        help="51% = Die KI handelt oft (schon bei leichtem Verdacht). 55% = Die KI ist extrem vorsichtig und macht kaum Trades."
+        min_value=25.0, max_value=60.0, value=35.0, step=1.0,
+        help="Dein Gewinnziel ist doppelt so groß wie der Stop-Loss. Mathematisch reicht hier schon eine Trefferchance von >33%, um Gewinn zu machen! 35% ist ein guter Startwert."
     )
     
-    # Übersetzung für den Hintergrund
+    # Übersetzung für den Hintergrund der Trading Engine
     kelly_map = {"Sehr Vorsichtig": 0.1, "Ausgewogen": 0.3, "Aggressiv": 0.6}
     kelly_fraction = kelly_map[risiko_level]
-    min_probability = ki_sicherheit / 100.0  # Macht aus 51.0 z.B. 0.51
+    
+    # Macht aus 35.0 für die Maschine 0.35
+    min_probability = ki_sicherheit / 100.0  
 
     st.markdown("---")
     
@@ -71,7 +73,7 @@ with col_rechts:
         else:
             with st.spinner("Die KI durchsucht den Markt nach Mustern... Das dauert ein paar Sekunden! ☕"):
                 
-                # Hier geben wir die neue min_probability mit!
+                # Konfiguration an die Maschine übergeben
                 cfg = Config(
                     tickers=tuple(assets),
                     initial_cash=startkapital,
@@ -82,11 +84,12 @@ with col_rechts:
                 )
                 
                 try:
+                    # Simulation starten
                     results = main_with_config(cfg) 
                     metrics = results["metrics"]
                     
                     if metrics["Trades"] == 0:
-                        st.error("📉 Die KI hat 0 Trades gefunden! Stelle den Regler 'Ab welcher Sicherheit soll die KI kaufen?' weiter nach links (z.B. auf 50.5%), damit sie mutiger wird.")
+                        st.error("📉 Die KI hat 0 Trades gefunden! Stelle den Regler 'Ab welcher Sicherheit soll die KI kaufen?' weiter nach links (z.B. auf 30%), damit sie mutiger wird.")
                     else:
                         st.success(f"Tada! Die Simulation ist fertig. Die KI hat {metrics['Trades']} Trades gemacht.")
                         
@@ -103,7 +106,8 @@ with col_rechts:
                         m3.metric(
                             label="Größter Rückschlag", 
                             value=f"{metrics['Max Drawdown']*100:.1f}%",
-                            delta_color="inverse"
+                            delta_color="inverse",
+                            help="Der tiefste finanzielle Einschnitt (Drawdown), den du hättest aushalten müssen."
                         )
                         
                         st.markdown("---")
