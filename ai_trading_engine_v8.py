@@ -3,38 +3,26 @@
 AI TRADING ENGINE v8.0
 =======================
 Next-Level Research-grade, event-driven ML trading framework.
-
-Neu in v8.0:
-- Multi-Asset Portfolio Aggregation & Pooled Machine Learning
-- LightGBM Gradient Boosting anstelle von Random Forests
-- Gaussian Mixture Model (GMM) Regime Detection (Risk-Off in High-Vol Regimes)
-- Optuna Hyperparameter Auto-Tuning Integration
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
-import json
 import logging
-import math
-import warnings
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
+import warnings
 
-import joblib
 import numpy as np
 import pandas as pd
-
-# Neue Next-Level Imports
 import lightgbm as lgb
 import optuna
 from sklearn.mixture import GaussianMixture
-
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.feature_selection import SelectFromModel
-from sklearn.metrics import brier_score_loss, roc_auc_score
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -52,60 +40,42 @@ log = logging.getLogger("AI-TRADING-v8")
 
 @dataclass
 class Config:
-    # --- Multi-Asset Data ---
-    tickers: Tuple[str, ...] = ("BTC-USD", "ETH-USD")  # Multi-Asset Support!
+    tickers: Tuple[str, ...] = ("BTC-USD", "ETH-USD")
     benchmark: str = "^GSPC"
     start_date: str = "2020-01-01"
     end_date: str = "2026-09-01"
-    data_provider: str = "yfinance"
     
     initial_cash: float = 10_000.0
-
-    # --- Execution & Broker ---
     fee_pct: float = 0.0010
     slippage_low: float = 0.0003
     slippage_high: float = 0.0015
     volatility_slippage_threshold: float = 1.5
-    market_impact_coeff: float = 0.0005
-    sizing_max_iter: int = 6
-    sizing_tol: float = 1e-4
 
-    # --- Barrier / Holding ---
+    # Standardwerte (werden von app.py überschrieben)
     atr_sl: float = 2.0
     atr_tp: float = 4.0
     max_hold_days: int = 5
-    intrabar_policy: str = "probabilistic" 
-
-    # --- Signal & Regime ---
+    
     min_probability: float = 0.55
-    use_regime_filter: bool = True     # GMM Regime Filter aktiviert
-    regime_penalty_factor: float = 0.5 # Halbiert Positionsgröße im Crash-Regime
-
-    # --- Kelly Sizing ---
+    use_regime_filter: bool = True
+    regime_penalty_factor: float = 0.5
     kelly_fraction: float = 0.50
     min_risk_pct: float = 0.0025
     max_risk_pct: float = 0.05
     max_exposure_pct: float = 1.00
 
-    # --- Walk-Forward ---
     min_train_days: int = 500
     embargo_days: int = 5
-    test_chunk: int = 30
-    refit_every: int = 30
-    purged_kfold_splits: int = 5
-
-    # --- Machine Learning (LightGBM) ---
+    
     n_estimators: int = 300
     max_depth: int = 6
     learning_rate: float = 0.01
     calibration_splits: int = 3
     random_state: int = 42
 
-    # --- Optuna Tuning ---
     run_optuna: bool = False
     optuna_trials: int = 20
 
-    # --- Features ---
     features: Tuple[str, ...] = (
         "RET_1D", "RET_3D", "RET_5D", "RET_10D", "RET_20D",
         "RSI", "ATR_PCT", "ATR_REGIME", "REALIZED_VOL_20", "RET_SKEW_20",
@@ -113,8 +83,7 @@ class Config:
         "VOL_RATIO", "VOLUME_RATIO", "RANGE_PCT", "BODY_PCT",
         "UPPER_WICK_PCT", "LOWER_WICK_PCT", "SP500_RET_3D", "SP500_RET_20D",
     )
-    
-    report_dir: Optional[str] = "backtest_results_v8"
+    report_dir: str = "backtest_results_v8"
 
 # ============================================================================
 # DATA & FEATURES
@@ -153,19 +122,16 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
     out["RSI"] = _rsi(close, 14)
     
-    # ATR
     prev_close = close.shift(1)
     tr = pd.concat([out["High"]-out["Low"], (out["High"]-prev_close).abs(), (out["Low"]-prev_close).abs()], axis=1).max(axis=1)
     out["ATR"] = tr.ewm(alpha=1.0/14, adjust=False).mean()
     out["ATR_PCT"] = out["ATR"] / close
     out["ATR_REGIME"] = out["ATR_PCT"] / out["ATR_PCT"].rolling(50).mean()
 
-    # Volatility & Skew
     log_ret = np.log(close / close.shift(1))
     out["REALIZED_VOL_20"] = log_ret.rolling(20).std()
     out["RET_SKEW_20"] = log_ret.rolling(20).skew()
 
-    # Moving Averages
     for p in (20, 50, 200):
         ema = close.ewm(span=p, adjust=False).mean()
         out[f"EMA{p}_DIST"] = close / ema - 1.0
@@ -233,13 +199,9 @@ class FoldModel:
 
 def _make_base_model(cfg: Config) -> lgb.LGBMClassifier:
     return lgb.LGBMClassifier(
-        n_estimators=cfg.n_estimators,
-        max_depth=cfg.max_depth,
-        learning_rate=cfg.learning_rate,
-        class_weight="balanced",
-        random_state=cfg.random_state,
-        n_jobs=-1,
-        verbose=-1
+        n_estimators=cfg.n_estimators, max_depth=cfg.max_depth,
+        learning_rate=cfg.learning_rate, class_weight="balanced",
+        random_state=cfg.random_state, n_jobs=-1, verbose=-1
     )
 
 def fit_fold_model(train: pd.DataFrame, cfg: Config) -> Optional[FoldModel]:
@@ -248,23 +210,20 @@ def fit_fold_model(train: pd.DataFrame, cfg: Config) -> Optional[FoldModel]:
 
     if len(train) < cfg.min_train_days or y.nunique() < 2: return None
 
-    # Feature Selection
     selector = SelectFromModel(_make_base_model(cfg), threshold="median", prefit=False).fit(X, y)
     selected = [f for f, keep in zip(cfg.features, selector.get_support()) if keep]
     
-    # Train Calibrated LightGBM
     cv = TimeSeriesSplit(n_splits=min(cfg.calibration_splits, max(2, len(train)//100)))
     model = CalibratedClassifierCV(_make_base_model(cfg), cv=cv, method="sigmoid")
     model.fit(selector.transform(X), y)
 
-    # Train Unsupervised GMM Market Regime on Volatility
-    gmm = None
-    high_vol_cluster = 0
+    gmm, high_vol_cluster = None, 0
     if cfg.use_regime_filter:
         gmm = GaussianMixture(n_components=2, random_state=cfg.random_state)
-        vol_data = train[['REALIZED_VOL_20']].fillna(0)
-        gmm.fit(vol_data)
-        high_vol_cluster = int(np.argmax(gmm.means_.flatten()))
+        vols = train[['REALIZED_VOL_20']].fillna(0)
+        if len(vols) > 0:
+            gmm.fit(vols)
+            high_vol_cluster = int(np.argmax(gmm.means_.flatten()))
 
     return FoldModel(model, selector, gmm, high_vol_cluster, selected)
 
@@ -273,23 +232,20 @@ def fit_fold_model(train: pd.DataFrame, cfg: Config) -> Optional[FoldModel]:
 # ============================================================================
 
 def objective_optuna(trial: optuna.Trial, pooled_data: pd.DataFrame, cfg: Config) -> float:
-    """Optuna sucht die besten Parameter per schnellem Purged K-Fold CV."""
     cfg_tune = dataclasses.replace(cfg)
     cfg_tune.atr_sl = trial.suggest_float("atr_sl", 1.0, 4.0)
     cfg_tune.atr_tp = trial.suggest_float("atr_tp", 1.0, 5.0)
-    cfg_tune.min_probability = trial.suggest_float("min_probability", 0.51, 0.65)
+    cfg_tune.min_probability = trial.suggest_float("min_probability", 0.35, 0.65)
     
-    # Label neu berechnen mit temporären Parametern
     df_tuned = create_labels(pooled_data, cfg_tune)
     df_clean = df_tuned.dropna(subset=list(cfg.features) + ["Target", "T1_OFFSET"]).copy()
     
     if len(df_clean) < cfg.min_train_days * 2: return 0.0
     
-    # Schneller CV Durchlauf
     idx = np.arange(len(df_clean))
     t1 = df_clean["T1_OFFSET"].to_numpy(dtype=int)
     exit_idx = idx + np.maximum(t1, 0)
-    fold_edges = np.linspace(0, len(df_clean), 4).astype(int) # 3 Folds für Speed
+    fold_edges = np.linspace(0, len(df_clean), 4).astype(int) 
     
     aucs = []
     for k in range(3):
@@ -311,34 +267,32 @@ def objective_optuna(trial: optuna.Trial, pooled_data: pd.DataFrame, cfg: Config
     return float(np.mean(aucs)) if aucs else 0.0
 
 def tune_hyperparameters(data: pd.DataFrame, cfg: Config) -> Config:
-    log.info("🚀 Starte Optuna Hyperparameter-Tuning...")
+    log.info("Starte Optuna Tuning...")
     study = optuna.create_study(direction="maximize")
     study.optimize(lambda trial: objective_optuna(trial, data, cfg), n_trials=cfg.optuna_trials)
-    
     best = study.best_params
-    log.info(f"Tuning beendet. Beste Parameter: {best}")
     return dataclasses.replace(cfg, atr_sl=best["atr_sl"], atr_tp=best["atr_tp"], min_probability=best["min_probability"])
 
 # ============================================================================
-# PORTFOLIO BACKTEST & BROKER (Regime Aware)
+# PORTFOLIO BACKTEST & BROKER
 # ============================================================================
 
 def size_from_kelly(cash: float, entry_price: float, sl_dist: float, prob: float, cfg: Config, regime_penalty: float=1.0) -> float:
     b = cfg.atr_tp / cfg.atr_sl
     q = 1.0 - prob
-    raw = max(0.0, (prob * b - q) / b)
+    raw = max(0.0, (prob * b - q) / b) if b > 0 else 0.0
     
     adjusted = raw * cfg.kelly_fraction * regime_penalty
     risk_pct = float(np.clip(adjusted, cfg.min_risk_pct, cfg.max_risk_pct))
     
-    qty = (cash * risk_pct) / sl_dist
+    qty = (cash * risk_pct) / sl_dist if sl_dist > 0 else 0.0
     return max(0.0, min(qty, (cash * cfg.max_exposure_pct) / entry_price))
 
 class PortfolioBroker:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.cash = cfg.initial_cash
-        self.positions = {} # ticker -> Position dict
+        self.positions = {} 
         self.trades = []
 
     def equity(self, marks: dict) -> float:
@@ -353,10 +307,8 @@ class PortfolioBroker:
             if ticker not in rows: continue
             row = rows[ticker]
             
-            exit_price = None
-            reason = None
+            exit_price, reason = None, None
             
-            # Intrabar Triple Barrier logic
             if row.Open <= pos['stop']: exit_price, reason = row.Open, "STOP_GAP"
             elif row.Open >= pos['target']: exit_price, reason = row.Open, "TP_GAP"
             elif row.Low <= pos['stop'] and row.High >= pos['target']:
@@ -381,11 +333,10 @@ class PortfolioBroker:
         for t in exits_to_remove: del self.positions[t]
 
     def process_entries(self, date: pd.Timestamp, signals: list):
-        # signals is a list of tuples: (ticker, row, probability, regime_penalty)
-        signals.sort(key=lambda x: x[2], reverse=True) # Höchste Prob zuerst
+        signals.sort(key=lambda x: x[2], reverse=True) 
         for ticker, row, prob, penalty in signals:
             if ticker in self.positions: continue
-            if self.cash <= self.cfg.initial_cash * 0.05: break # Fast kein Cash mehr
+            if self.cash <= self.cfg.initial_cash * 0.05: break 
             
             sl_dist = self.cfg.atr_sl * row.ATR
             slip = self.cfg.slippage_high if row.VOL_RATIO > self.cfg.volatility_slippage_threshold else self.cfg.slippage_low
@@ -413,9 +364,7 @@ def run_portfolio_backtest(data_dict: Dict[str, pd.DataFrame], prob_dict: Dict[s
     equity_curve = []
     
     for date in sorted_dates:
-        rows = {}
-        marks = {}
-        signals = []
+        rows, marks, signals = {}, {}, []
         
         for t, df in data_dict.items():
             if date in df.index:
@@ -423,9 +372,8 @@ def run_portfolio_backtest(data_dict: Dict[str, pd.DataFrame], prob_dict: Dict[s
                 rows[t] = row
                 marks[t] = row.Close
                 
-                # Signal Generation
                 prob = prob_dict[t].get(date, np.nan)
-                if prob >= cfg.min_probability and row.Close > row.EMA200_DIST: # Trend Filter
+                if prob >= cfg.min_probability and row.Close > row.EMA200_DIST: 
                     regime = regime_dict[t].get(date, 0)
                     penalty = cfg.regime_penalty_factor if regime == 1 else 1.0
                     signals.append((t, row, prob, penalty))
@@ -437,10 +385,10 @@ def run_portfolio_backtest(data_dict: Dict[str, pd.DataFrame], prob_dict: Dict[s
     return pd.DataFrame(equity_curve).set_index("Date")["Equity"], broker.trades
 
 # ============================================================================
-# MAIN PIPELINE
+# STREAMLIT BRÜCKE & MAIN PIPELINE
 # ============================================================================
+
 def main_with_config(cfg: Config) -> dict:
-    # 1. Daten holen
     data_dict = {}
     for ticker in cfg.tickers:
         raw = _fetch_yfinance(ticker, cfg.benchmark, cfg.start_date, cfg.end_date)
@@ -451,7 +399,6 @@ def main_with_config(cfg: Config) -> dict:
     if cfg.run_optuna:
         cfg = tune_hyperparameters(pooled_data, cfg)
 
-    # Walk-Forward Training
     split_idx = int(len(pooled_data) * 0.7)
     train_pool = create_labels(pooled_data.iloc[:split_idx], cfg).dropna(subset=["Target"])
 
@@ -460,7 +407,7 @@ def main_with_config(cfg: Config) -> dict:
     prob_dict, regime_dict = {}, {}
     for t, df in data_dict.items():
         df_eval = df.dropna(subset=list(cfg.features))
-        if model:
+        if model and len(df_eval) > 0:
             Xt = model.selector.transform(df_eval[list(cfg.features)])
             prob_dict[t] = pd.Series(model.model.predict_proba(Xt)[:, 1], index=df_eval.index)
             
@@ -471,10 +418,12 @@ def main_with_config(cfg: Config) -> dict:
                 regime_dict[t] = pd.Series(regimes, index=df_eval.index)
             else:
                 regime_dict[t] = pd.Series(0, index=df_eval.index)
+        else:
+            prob_dict[t] = pd.Series(np.nan, index=df_eval.index)
+            regime_dict[t] = pd.Series(0, index=df_eval.index)
 
     equity, trades = run_portfolio_backtest(data_dict, prob_dict, regime_dict, cfg)
 
-    # Ergebnisse für die GUI berechnen
     ret = equity.iloc[-1] / equity.iloc[0] - 1.0 if not equity.empty else 0.0
     dd = (equity / equity.cummax() - 1.0).min() if not equity.empty else 0.0
     wins = [t for t in trades if t['pnl'] > 0]
@@ -495,78 +444,9 @@ def main_with_config(cfg: Config) -> dict:
     }
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--tune", action="store_true", help="Run Optuna Hyperparameter Tuning")
-    args = parser.parse_args()
-    
-    cfg = Config(run_optuna=args.tune)
-    Path(cfg.report_dir).mkdir(exist_ok=True)
-    
-    # 1. Daten holen & Features bauen
-    data_dict = {}
-    for ticker in cfg.tickers:
-        log.info(f"Lade Daten für {ticker}...")
-        raw = _fetch_yfinance(ticker, cfg.benchmark, cfg.start_date, cfg.end_date)
-        data_dict[ticker] = build_features(raw)
-        
-    # Pool Daten für das universelle ML-Modell
-    pooled_data = pd.concat(data_dict.values(), keys=cfg.tickers)
-    
-    # 2. Optuna (Optional)
-    if cfg.run_optuna:
-        cfg = tune_hyperparameters(pooled_data, cfg)
-        
-    # 3. Walk-Forward / Pooled Training
-    # (Aus Performancegründen simulieren wir hier einen stark optimierten simplen Walk-Forward Cut)
-    split_idx = int(len(pooled_data) * 0.7)
-    train_pool = create_labels(pooled_data.iloc[:split_idx], cfg).dropna(subset=["Target"])
-    
-    log.info("🧠 Trainiere Universal LightGBM & GMM auf Pooled Data...")
-    model = fit_fold_model(train_pool, cfg)
-    
-    prob_dict, regime_dict = {}, {}
-    for t, df in data_dict.items():
-        df_eval = df.dropna(subset=list(cfg.features))
-        if model:
-            Xt = model.selector.transform(df_eval[list(cfg.features)])
-            prob_dict[t] = pd.Series(model.model.predict_proba(Xt)[:, 1], index=df_eval.index)
-            
-            if model.gmm:
-                vols = df_eval[['REALIZED_VOL_20']].fillna(0)
-                clusters = model.gmm.predict(vols)
-                # Mappe GMM-Cluster auf 0 (Bull) und 1 (Crash)
-                regimes = (clusters == model.high_vol_cluster).astype(int)
-                regime_dict[t] = pd.Series(regimes, index=df_eval.index)
-            else:
-                regime_dict[t] = pd.Series(0, index=df_eval.index)
-                
-    # 4. Multi-Asset Portfolio Backtest
-    log.info("💼 Starte Multi-Asset Portfolio Backtest...")
-    equity, trades = run_portfolio_backtest(data_dict, prob_dict, regime_dict, cfg)
-    
-    # 5. Report generieren
-    ret = equity.iloc[-1] / equity.iloc[0] - 1.0
-    cagr = (1+ret) ** (365.25/(equity.index[-1]-equity.index[0]).days) - 1.0
-    dd = (equity / equity.cummax() - 1.0).min()
-    win_rate = len([t for t in trades if t['pnl'] > 0]) / len(trades) if trades else 0
-    
-    print("\n" + "="*60)
-    print(" 🚀 AI TRADING ENGINE v8.0 - PORTFOLIO REPORT")
-    print("="*60)
-    print(f"Portfolio Assets : {', '.join(cfg.tickers)}")
-    print(f"Total Return     : {ret*100:.2f}%")
-    print(f"CAGR (Annual.)   : {cagr*100:.2f}%")
-    print(f"Max Drawdown     : {dd*100:.2f}%")
-    print(f"Total Trades     : {len(trades)}")
-    print(f"Win Rate         : {win_rate*100:.2f}%")
-    if cfg.use_regime_filter:
-        print(f"Regime Filter    : Aktiviert (Halbiert Size in High-Vol Phasen)")
-    print("="*60)
-    
-    # Export
-    equity.to_csv(f"{cfg.report_dir}/portfolio_equity.csv")
-    pd.DataFrame(trades).to_csv(f"{cfg.report_dir}/portfolio_trades.csv", index=False)
-    log.info(f"💾 Report gespeichert in '{cfg.report_dir}/'")
+    cfg = Config()
+    results = main_with_config(cfg)
+    print(results["metrics"])
 
 if __name__ == "__main__":
     main()
